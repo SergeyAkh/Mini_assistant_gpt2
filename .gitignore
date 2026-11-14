@@ -1,0 +1,23 @@
+# environments, IDE, OS
+.venv/
+venv/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# model weights and checkpoints (too large for GitHub)
+srs/gpt_trained_weights/
+srs/model_trained_weights/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# datasets (generated or downloaded, not stored in the repo)
+srs/dataset/data/
+
+# local working copy
+LLM_classification_v2/
+srs/tokenizer/

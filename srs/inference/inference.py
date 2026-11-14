@@ -1,12 +1,15 @@
 # inference.py
 
 from srs.inference.help import *
-
+from srs.training.help_func import (get_device, get_tokenizer, get_model, load_checkpoint)
+from torch.optim import AdamW
 device = get_device()
 
-MAX_NEW_TOKENS = 100
-TEMPERATURE = 0.8
-TOP_K = 50
+MAX_NEW_TOKENS = 200
+TEMPERATURE = 0.7
+TOP_K = 40
+TOP_P = 0.9
+ADAPTER = None   # must match the ADAPTER used in training: None (full fine-tune), "LoRA" or "DoRA"
 
 # ---- Load tokenizer ----
 tokenizer = get_tokenizer()
@@ -14,50 +17,27 @@ tokenizer = get_tokenizer()
 # special tokens
 ASSISTANT_TOKEN = Config.ASSIST_TOKEN
 USER_TOKEN = Config.USER_TOKEN
-
+model_name = "custom_gpt2"
 # ---- Load model ----
-model = get_model(tokenizer, lora=False, r=16, alpha=16).to(device)
-CHECKPOINT_PATH = Config.MODEL_WEIGHTS_PATH / "checkpoint_LoRA.pt"
+model = get_model(model_name, tokenizer, lora=ADAPTER, r=16,
+                  alpha=32, dropout=0.0).to(device)
+
+model_type = Config.MODEL_TYPE
+
+CHECKPOINT_PATH = Config.MODEL_WEIGHTS_PATH / f"checkpoint_{model_name}_{model_type}_best.pt"
+if not CHECKPOINT_PATH.exists():     # fall back to the latest checkpoint
+    CHECKPOINT_PATH = Config.MODEL_WEIGHTS_PATH / f"checkpoint_{model_name}_{model_type}.pt"
+
 checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
 model.load_state_dict(checkpoint["model_state"])
+print(f"Loaded {CHECKPOINT_PATH.name}")
+
 model.eval()
 
-
-def generate(model, input_ids):
-    for _ in range(MAX_NEW_TOKENS):
-        with torch.no_grad():
-            logits = model(input_ids)
-
-        next_token_logits = logits[:, -1, :] / TEMPERATURE
-
-        # top-k sampling
-        top_k_values, top_k_indices = torch.topk(next_token_logits, TOP_K)
-        probs = torch.softmax(top_k_values, dim=-1)
-        next_token = top_k_indices[0, torch.multinomial(probs, 1)]
-
-        input_ids = torch.cat([input_ids, next_token], dim=1)
-
-        # stop if assistant finished (you can customize this)
-        if next_token.item() == tokenizer.eos_token_id:
-            break
-
-    return input_ids
-
-
-
-
-def build_prompt(history):
-    prompt = ""
-    for role, text in history:
-        if role == "user":
-            prompt += f"{USER_TOKEN} {text}\n"
-        else:
-            prompt += f"{ASSISTANT_TOKEN} {text}\n"
-
-    prompt += f"{ASSISTANT_TOKEN} "
-
-    return prompt
-
+def clear_history(history):
+    """Clear the entire conversation history."""
+    history.clear()
+    print("History has been cleared!")
 
 def main():
     print("Chat started. Type 'exit' to quit.\n")
@@ -69,24 +49,22 @@ def main():
 
         if user_input.lower() == "exit":
             break
+        elif user_input.lower() == "clear":
+            clear_history(history)
+            print("Conversation history erased. Starting fresh!\n")
+            continue
 
         history.append(("user", user_input))
+        # print(f"history: {history}")
 
-        prompt = build_prompt(history)
+        # the history is formatted with the same template as the training data
+        answer = temp_predict(model_name, model, history, tokenizer, device,
+                              max_new_tokens=MAX_NEW_TOKENS, temperature=TEMPERATURE,
+                              top_k=TOP_K, top_p=TOP_P)
 
-        # input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-
-        # output_ids = generate(model, input_ids)
-        # decoded = tokenizer.decode(output_ids[0])
-        # extract only last assistant answer
-        # answer = decoded.split(ASSISTANT_TOKEN)[-1].strip()
-
-
-        answer = temp_predict(model, prompt, tokenizer, device, temperature=TEMPERATURE)
         print(f"Bot: {answer}\n")
 
         history.append(("assistant", answer))
-
 
 if __name__ == "__main__":
     main()

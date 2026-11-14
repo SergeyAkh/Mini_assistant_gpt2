@@ -3,11 +3,14 @@ from srs.LLM_classification.config import Config
 from model.Load_model import GPT2Loader
 from model.GPT_manual_architecture import GPTModel, MultiHeadAttention, FeedForward
 from model.LoRA import LoRALinear
+from model.DoRA import DoRALinear
+import torch
 import torch.nn as nn
 
-# import importlib
-# import model.LoRA as hf
-# importlib.reload(hf)
+import importlib
+import model.GPT_manual_architecture as hf
+importlib.reload(hf)
+
 class GPT2Manager:
     """
     Handles GPT-2 model initialization:
@@ -16,7 +19,7 @@ class GPT2Manager:
     - Builds PyTorch GPT model
     """
 
-    def __init__(self, use_lora=True, r=8, alpha = 1, dropout=0.05):
+    def __init__(self, use_lora=None, r=8, alpha = 1, dropout=0.05):
         # Load configuration
         self.r = r
         self.alpha = alpha
@@ -38,6 +41,8 @@ class GPT2Manager:
         self.model = None
 
     def resize_token_embeddings(self, new_vocab_size):
+        """Properly resize token embeddings and output head."""
+
         old_vocab_size, emb_dim = self.model.tok_emb.weight.shape
 
         if new_vocab_size <= old_vocab_size:
@@ -45,34 +50,54 @@ class GPT2Manager:
 
         device = self.model.tok_emb.weight.device
 
-        # --- tok_emb ---
+        # --- Create new embeddings ---
         new_tok_emb = nn.Embedding(new_vocab_size, emb_dim).to(device)
         new_tok_emb.weight.data[:old_vocab_size] = self.model.tok_emb.weight.data
-        nn.init.normal_(new_tok_emb.weight.data[old_vocab_size:], mean=0.0, std=0.02)
-
-        self.model.tok_emb = new_tok_emb
-
-        # --- out_head ---
+        new_tok_emb.weight.data[old_vocab_size:] = self.model.tok_emb.weight.data[:old_vocab_size].mean(dim=0,
+                                                                                                        keepdim=True)
+        # --- Create new output head ---
         new_out_head = nn.Linear(emb_dim, new_vocab_size, bias=False).to(device)
         new_out_head.weight.data[:old_vocab_size] = self.model.out_head.weight.data
-        nn.init.normal_(new_out_head.weight.data[old_vocab_size:], mean=0.0, std=0.02)
+        new_out_head.weight.data[old_vocab_size:] = self.model.out_head.weight.data[:old_vocab_size].mean(dim=0,
+                                                                                                          keepdim=True)
+        # --- CRITICAL: Register properly as modules ---
+        # Remove old modules first
+        delattr(self.model, 'tok_emb')
+        delattr(self.model, 'out_head')
 
-        self.model.out_head = new_out_head
+        # Add new modules (this registers them properly)
+        self.model.add_module('tok_emb', new_tok_emb)
+        self.model.add_module('out_head', new_out_head)
 
-        # --- weight tying ---
-        self.model.out_head.weight = self.model.tok_emb.weight
+    def freeze_except_adapter(self, model):
+        """Train only the adapters (LoRA/DoRA A, B and DoRA magnitude) ...
 
-    def freeze_except_lora(self, model):
+        The old version matched any parameter name containing an uppercase "A" or "B", which
+        missed the DoRA magnitude vectors, and it froze tok_emb / out_head completely - including the
+        randomly initialised rows of the two new tokens <|user|> and <|assistant|>, which could
+        therefore never be learned.
+        """
         for name, param in model.named_parameters():
-            if "A" in name or "B" in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+            param.requires_grad = name.endswith((".A", ".B", ".magnitude"))
+
+        # ... plus the rows of the NEW special tokens in the embedding and output head.
+        # The pretrained rows stay untouched: their gradient is zeroed by a hook. (Use weight_decay=0
+        # with adapters, otherwise AdamW would still shrink the frozen rows slightly.)
+        base_vocab = Config.BASE_CONFIG["vocab_size"]   # 50257 for every GPT-2 size
+
+        def only_new_rows(grad):
+            keep = (torch.arange(grad.shape[0], device=grad.device) >= base_vocab)
+            return grad * keep.unsqueeze(1).to(grad.dtype)
+
+        for weight in (model.tok_emb.weight, model.out_head.weight):
+            weight.requires_grad = True
+            weight.register_hook(only_new_rows)
 
     def apply_lora(self, model, enabled=True):
 
         for module in model.modules():
-            if isinstance(module, MultiHeadAttention):
+            if module.__class__.__name__ == "MultiHeadAttention":
+
                 module.W_query = LoRALinear(
                     module.W_query, r=self.r, alpha=self.alpha, dropout=self.dropout
                 )
@@ -92,11 +117,81 @@ class GPT2Manager:
                     module.out_proj, r=self.r, alpha=self.alpha, dropout=self.dropout
                 )
                 module.out_proj.enabled = enabled
+
             elif isinstance(module, FeedForward):
                 for i, layer in enumerate(module.layers):
                     if isinstance(layer, nn.Linear):
                         module.layers[i] = LoRALinear(layer, r=self.r, alpha=self.alpha, dropout=self.dropout)
                         module.layers[i].enabled = enabled
+
+    def apply_dora(self, model, enabled=True):
+
+        for module in model.modules():
+            if module.__class__.__name__ == "MultiHeadAttention":
+
+                module.W_query = DoRALinear(
+                    module.W_query, r=self.r, alpha=self.alpha, dropout=self.dropout
+                )
+                module.W_query.enabled = enabled
+
+                module.W_value = DoRALinear(
+                    module.W_value, r=self.r, alpha=self.alpha, dropout=self.dropout
+                )
+                module.W_value.enabled = enabled
+
+                module.W_key = DoRALinear(
+                    module.W_key, r=self.r, alpha=self.alpha, dropout=self.dropout
+                )
+                module.W_key.enabled = enabled
+
+                module.out_proj = DoRALinear(
+                    module.out_proj, r=self.r, alpha=self.alpha, dropout=self.dropout
+                )
+                # module.out_proj.enabled = enabled
+
+            elif isinstance(module, FeedForward):
+                for i, layer in enumerate(module.layers):
+                    if isinstance(layer, nn.Linear):
+                        module.layers[i] = DoRALinear(layer, r=self.r, alpha=self.alpha, dropout=self.dropout)
+                        # module.layers[i].enabled = enabled
+        # for module in list(model.modules()):
+        #
+        #     if isinstance(module, MultiHeadAttention):
+        #
+        #         for name in (
+        #                 "W_query",
+        #                 "W_key",
+        #                 "W_value",
+        #                 "out_proj",
+        #         ):
+        #             layer = getattr(module, name)
+        #
+        #             setattr(
+        #                 module,
+        #                 name,
+        #                 DoRALinear(
+        #                     layer,
+        #                     r=self.r,
+        #                     alpha=self.alpha,
+        #                     dropout=self.dropout,
+        #                 ),
+        #             )
+        #
+        #             getattr(module, name).enabled = enabled
+        #
+        #     elif isinstance(module, FeedForward):
+        #
+        #         for i, layer in enumerate(module.layers):
+        #
+        #             if isinstance(layer, nn.Linear):
+        #                 module.layers[i] = DoRALinear(
+        #                     layer,
+        #                     r=self.r,
+        #                     alpha=self.alpha,
+        #                     dropout=self.dropout,
+        #                 )
+        #
+        #                 module.layers[i].enabled = enabled
 
     def prepare_model(self, tokenizer, inference = None):
         self.loader = GPT2Loader(model_size=self.model_size, models_dir=self.path)
@@ -104,22 +199,28 @@ class GPT2Manager:
         self.settings, self.params = self.loader.download_and_load()
 
         self.model = GPTModel(self.base_config)
-        if inference is None:
 
+        if inference is None:
             self.loader.load_weights_into_gpt(self.model)
 
-        if self.use_lora:
-            self.apply_lora(self.model, enabled=True)
-            self.freeze_except_lora(self.model)
+        if self.use_lora == "DoRA":
+            self.apply_dora(self.model, enabled=True)
+            # self.freeze_except_adapter(self.model)
 
-        # 🔥 New tokens
+
+        if self.use_lora == "LoRA":
+
+            self.apply_lora(self.model, enabled=True)
+            self.freeze_except_adapter(self.model)
+
         if tokenizer is not None:
 
             new_vocab_size = len(tokenizer)
 
             self.resize_token_embeddings(new_vocab_size)
-            if self.use_lora:
-                self.freeze_except_lora(self.model)
+
+            if self.use_lora in ("LoRA", "DoRA"):
+                self.freeze_except_adapter(self.model)
             # self.base_config["vocab_size"] = new_vocab_size
         else:
             abort()
